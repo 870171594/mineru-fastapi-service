@@ -2,11 +2,11 @@
 MinerU FastAPI 服务测试客户端示例
 运行前请确保:
 1. FastAPI 服务已在本地启动: uvicorn app:app --host 0.0.0.0 --port 8000
-2. 准备好您的官方 MinerU API Token (可在 https://mineru.net/apiManage/docs 获取)
+2. 若服务端处于【私有模式 (private)】，服务端会自动使用其环境变量的 MINERU_API_KEY，此处无需再传 token。
+3. 若服务端处于【公开模式 (public)】，请提供 --token 或设置环境变量 MINERU_API_KEY。
 """
 
 import argparse
-import json
 import os
 import sys
 import httpx
@@ -18,24 +18,23 @@ DEFAULT_TEST_PDF = "https://cdn-mineru.openxlab.org.cn/demo/example.pdf"
 def main():
     parser = argparse.ArgumentParser(description="测试 MinerU FastAPI 单文件解析接口")
     parser.add_argument("--url", default=DEFAULT_TEST_PDF, help="待解析的文件 URL (默认官方 demo.pdf)")
-    parser.add_argument("--token", default=os.getenv("MINERU_API_KEY"), help="官方 MinerU API Token (或读取环境变量 MINERU_API_KEY)")
+    parser.add_argument("--token", default=os.getenv("MINERU_API_KEY"), help="MinerU API Token (私有模式下可省略)")
     parser.add_argument("--server", default=API_SERVER_URL, help="FastAPI 服务接口地址")
     parser.add_argument("--output", default=None, help="将结果 Markdown 保存到文件")
     args = parser.parse_args()
 
-    token = args.token
-    if not token:
-        print("[!] 警告: 未提供 MinerU API Token。")
-        print("    请通过参数传入: python test_client.py --token <YOUR_TOKEN>")
-        print("    或设置环境变量: export MINERU_API_KEY=<YOUR_TOKEN> (PowerShell: $env:MINERU_API_KEY='...')")
-        token = input("请输入您的 MinerU API Token (直接回车退出): ").strip()
-        if not token:
-            sys.exit(1)
-
     headers = {
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+
+    if args.token:
+        token = args.token.strip()
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+        print("[*] 携带客户端指定的 Authorization Token 请求")
+    else:
+        print("[*] 未提供客户端 Token，将依赖服务端私有模式 (Private Mode) 的环境变量凭证")
 
     payload = {
         "file_url": args.url,
@@ -52,6 +51,15 @@ def main():
         # 设置相对宽松的客户端超时时间
         with httpx.Client(timeout=360.0) as client:
             resp = client.post(args.server, headers=headers, json=payload)
+            if resp.status_code == 401:
+                print("\n[-] 请求失败 (HTTP 401): 服务端处于公开模式但未提供 Token，或 Token 无效。")
+                print("    请通过 --token 参数传入有效 API Key: python test_client.py --token <YOUR_TOKEN>")
+                sys.exit(1)
+            elif resp.status_code == 500 and "MINERU_API_KEY" in resp.text:
+                print("\n[-] 请求失败 (HTTP 500): 服务端处于私有模式，但服务端尚未配置 MINERU_API_KEY。")
+                print("    请在服务端的 .env 文件中配置 MINERU_API_KEY，或通过 --token 传入。")
+                sys.exit(1)
+
             resp.raise_for_status()
             res = resp.json()
 
@@ -76,7 +84,7 @@ def main():
                     f.write(markdown_content)
                 print(f"\n[+] 完整 Markdown 已保存至: {args.output}")
         else:
-            print(f"[-] 解析失败: {res.get('msg')}")
+            print(f"[-] 解析未成功: {res.get('msg')}")
 
     except Exception as e:
         print(f"[-] 请求异常: {e}")

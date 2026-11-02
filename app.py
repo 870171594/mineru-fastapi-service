@@ -1,19 +1,27 @@
 """
 MinerU 官方在线 API FastAPI 请求套件
 文档依据: https://mineru.net/apiManage/docs (精准解析 - 单文件解析)
+支持模式:
+1. 私有模式 (private, 默认): 默认直接使用服务端环境变量/ .env 中的 MINERU_API_KEY，客户端无需在请求头传入 Authorization
+2. 公开模式 (public): 严格要求客户端在请求头传入各自分配的 MinerU Authorization Token
 """
 
 import asyncio
 import io
 import logging
+import os
 import time
 import zipfile
 from typing import Optional
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# 优先加载本地 .env 文件
+load_dotenv()
 
 # 配置日志
 logging.basicConfig(
@@ -22,10 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mineru-service")
 
+# 读取服务模式与初始环境配置
+DEFAULT_SERVICE_MODE = os.getenv("MINERU_SERVICE_MODE", "private").strip().lower()
+logger.info("MinerU 服务启动中... 运行模式: [%s]", DEFAULT_SERVICE_MODE)
+
 app = FastAPI(
     title="MinerU 官方云端解析 FastAPI 服务",
-    description="免本地安装大模型与 GPU，直接调用 MinerU 官方云端 API 解析单文件并返回 Markdown 内容",
-    version="1.0.0"
+    description="免本地安装大模型与 GPU，直接调用 MinerU 官方云端 API 解析单文件并返回 Markdown 内容。支持私有模式与公开模式",
+    version="1.1.0"
 )
 
 # 允许跨域（方便前端或 Agent 调用）
@@ -64,17 +76,40 @@ class ParseResponse(BaseModel):
     trace_id: Optional[str] = Field(default=None, description="请求跟踪 ID")
 
 
-def normalize_auth_header(auth_header: Optional[str]) -> str:
-    """格式化 Authorization 请求头，确保带 Bearer 前缀"""
-    if not auth_header:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="缺少 Authorization 请求头。请在请求头中传入官方 MinerU API Key。"
-        )
-    auth_header = auth_header.strip()
-    if not auth_header.lower().startswith("bearer "):
-        return f"Bearer {auth_header}"
-    return auth_header
+def resolve_auth_token(auth_header: Optional[str]) -> str:
+    """
+    鉴权凭证解析策略：
+    1. 若请求头中携带了 Authorization（且非空），优先使用客户端传入的 Token（支持 Bearer 或纯 Token）；
+    2. 若请求头未携带 Authorization：
+       - 私有模式 (private, 默认)：自动读取环境变量/ .env 中的 MINERU_API_KEY；
+       - 公开模式 (public)：抛出 401 Unauthorized 异常，强制客户端自行传参。
+    """
+    # 客户端显式传递了 Token，直接使用
+    if auth_header and auth_header.strip():
+        token = auth_header.strip()
+        if not token.lower().startswith("bearer "):
+            return f"Bearer {token}"
+        return token
+
+    # 未传递 Token 时，根据运行模式判断
+    mode = os.getenv("MINERU_SERVICE_MODE", "private").strip().lower()
+
+    if mode == "private":
+        env_key = os.getenv("MINERU_API_KEY", "").strip()
+        if not env_key:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="当前处于 [私有模式 (private)]，但未在服务端环境变量或 .env 中设置 MINERU_API_KEY。请先配置该环境变量，或在请求头中传入 Authorization。"
+            )
+        if not env_key.lower().startswith("bearer "):
+            return f"Bearer {env_key}"
+        return env_key
+
+    # 公开模式：强制要求客户端提供
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="当前处于 [公开多租户模式 (public)]，必须在请求头中传入 Authorization: Bearer <YOUR_API_KEY>。"
+    )
 
 
 def determine_model_version(file_url: str, custom_model: Optional[str]) -> str:
@@ -123,14 +158,14 @@ async def fetch_markdown_from_zip(zip_url: str, client: httpx.AsyncClient) -> st
 async def parse_single_file(
     request_data: Optional[ParseRequest] = None,
     file_url: Optional[str] = Query(None, description="待解析的文件 URL (兼容 GET/Query 参数)"),
-    authorization: Optional[str] = Header(None, alias="Authorization", description="MinerU 官方 API Key (Bearer Token)")
+    authorization: Optional[str] = Header(None, alias="Authorization", description="MinerU 官方 API Key (私有模式下可选，公共模式下必填)")
 ):
     """
-    一步式单文件解析接口：
-    1. 接收 file_url 与 Authorization 请求头；
-    2. 向 MinerU 官方接口提交解析任务；
+    单文件精准解析接口：
+    1. 解析鉴权凭证（私有模式自动使用环境 MINERU_API_KEY，公开模式强制要求传入）；
+    2. 向 MinerU 官方接口提交任务；
     3. 异步轮询任务状态直至完成；
-    4. 自动解压并返回解析出的 Markdown 文本内容。
+    4. 内存流式解压并返回解析出的 Markdown 文本内容。
     """
     # 兼容 JSON Body 与 Query 参数
     target_url = None
@@ -160,7 +195,8 @@ async def parse_single_file(
             detail="缺少必填参数 'file_url'。"
         )
 
-    auth_token = normalize_auth_header(authorization)
+    # 确定最终使用的 API Key Token
+    auth_token = resolve_auth_token(authorization)
     selected_model = determine_model_version(target_url, model_version)
 
     headers = {
@@ -300,6 +336,14 @@ async def parse_single_file(
             )
 
 
-@app.get("/health", summary="健康检查")
+@app.get("/health", summary="健康检查与运行模式")
 async def health_check():
-    return {"status": "ok", "service": "mineru-fastapi-service"}
+    """返回当前服务健康状态、运行模式与环境变量凭证配置情况"""
+    mode = os.getenv("MINERU_SERVICE_MODE", "private").strip().lower()
+    has_key = bool(os.getenv("MINERU_API_KEY", "").strip())
+    return {
+        "status": "ok",
+        "service": "mineru-fastapi-service",
+        "mode": mode,
+        "has_env_key": has_key
+    }
