@@ -6,6 +6,10 @@
 
 `POST /search`
 
+请求必须携带 `Authorization: Bearer <调用者的智谱APIKEY>`，也兼容纯 Key。每位插件使用者配置自己的 Key，服务不会回退使用服务器环境变量或 `.env`。未传时返回 `401` 和 `请传入鉴权信息：智谱 APIKEY`。
+
+响应头 `X-Auth-Source: client` 表示已收到客户端凭证（不表示智谱已认证通过）；`missing` 表示未收到。服务日志只记录凭证是否收到，不记录 Key。
+
 ```json
 {
   "query": "大学生创新创业比赛评审规则",
@@ -39,7 +43,7 @@
 }
 ```
 
-`GET /search/health` 返回服务状态及是否配置 Key，不返回 Key 值。Swagger 文档位于 `/search/docs`。`503` 表示未配置 Key，`429` 表示上游限流，`502`/`504` 表示上游失败或超时；不会把上游错误伪装成空搜索结果。
+`GET /search/health` 返回服务状态和 `auth_mode: client`。Swagger 文档位于 `/search/docs`。`401` 表示缺少凭证或智谱拒绝凭证，`429` 表示上游限流，`502`/`504` 表示上游失败或超时；不会把上游错误伪装成空搜索结果。
 
 ## 本地运行
 
@@ -47,8 +51,7 @@
 cd search_service
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp .env.example .env
-# 将 ZHIPU_API_KEY 写入 .env；不要提交此文件
+# API Key 由调用者通过 Authorization 请求头提供
 .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8100
 ```
 
@@ -69,7 +72,6 @@ Type=simple
 User=agentarts-search
 Group=agentarts-search
 WorkingDirectory=/opt/agentarts-search
-EnvironmentFile=-/etc/agentarts-search.env
 ExecStart=/opt/agentarts-search/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8100 --workers 2 --no-access-log --limit-concurrency 32
 Restart=on-failure
 RestartSec=5
@@ -80,13 +82,7 @@ ProtectHome=true
 UMask=0077
 ```
 
-`/etc/agentarts-search.env` 示例：
-
-```env
-ZHIPU_API_KEY=replace-with-your-key
-```
-
-该文件应由 root 持有，权限设为 `600`。也可以用服务目录下的 `.env`；请勿将任何真实密钥提交到 Git。
+无需在服务器配置智谱 Key。请勿将调用者的真实密钥写入日志或提交到 Git。
 
 HTTPS Nginx 反代示例（把 `location` 放到现有 TLS server 内；按需与已有路径规则合并）：
 

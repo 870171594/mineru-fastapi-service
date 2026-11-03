@@ -1,15 +1,13 @@
 """Standalone AgentArts search relay using Zhipu Web Search API."""
-import os
-from pathlib import Path
+import logging
 from typing import Literal
 
 import httpx
-from dotenv import dotenv_values
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 UPSTREAM_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
-KEY_FILE = Path(__file__).with_name(".env")
+logger = logging.getLogger("uvicorn.error")
 app = FastAPI(
     title="AgentArts 智谱联网搜索",
     version="1.0.0",
@@ -19,8 +17,15 @@ app = FastAPI(
 )
 
 
-def get_api_key():
-    return (os.getenv("ZHIPU_API_KEY") or dotenv_values(KEY_FILE).get("ZHIPU_API_KEY") or "").strip()
+def resolve_auth_token(authorization: str | None) -> str:
+    key = (authorization or "").strip()
+    if key.lower() == "bearer":
+        key = ""
+    elif key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    if not key:
+        raise HTTPException(401, detail="请传入鉴权信息：智谱 APIKEY", headers={"WWW-Authenticate": "Bearer", "X-Auth-Source": "missing"})
+    return "Bearer " + key
 
 
 class SearchRequest(BaseModel):
@@ -51,18 +56,17 @@ class SearchResponse(BaseModel):
 
 @app.get("/search/health")
 def health():
-    return {"status": "ok", "service": "agentarts-search", "provider": "zhipu", "has_env_key": bool(get_api_key())}
+    return {"status": "ok", "service": "agentarts-search", "provider": "zhipu", "auth_mode": "client", "auth_header": "Authorization"}
 
 
 @app.post("/search", response_model=SearchResponse, summary="智谱联网搜索")
-async def search(request: SearchRequest):
+async def search(request: SearchRequest, response: Response, authorization: str | None = Header(default=None, description="调用者的智谱 API Key，支持 Bearer 前缀或纯 Key")):
+    token = resolve_auth_token(authorization)
+    auth_headers = {"X-Auth-Source": "client"}
+    logger.info("Search request: Authorization received; credential source=client")
     query = request.query.strip()
     if not query:
         raise HTTPException(422, detail="query 不能为空")
-    key = get_api_key()
-    if not key:
-        raise HTTPException(503, detail="服务端尚未配置 ZHIPU_API_KEY")
-    token = key if key.lower().startswith("bearer ") else "Bearer " + key
     payload = {
         "search_query": query,
         "search_engine": request.search_engine,
@@ -75,19 +79,19 @@ async def search(request: SearchRequest):
         payload["search_domain_filter"] = request.search_domain_filter
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
-            response = await client.post(UPSTREAM_URL, headers={"Authorization": token}, json=payload)
+            upstream = await client.post(UPSTREAM_URL, headers={"Authorization": token}, json=payload)
     except httpx.TimeoutException:
-        raise HTTPException(504, detail="智谱搜索请求超时，请稍后重试") from None
+        raise HTTPException(504, detail="智谱搜索请求超时，请稍后重试", headers=auth_headers) from None
     except httpx.RequestError:
-        raise HTTPException(502, detail="无法连接智谱搜索服务") from None
-    if response.status_code == 429:
-        raise HTTPException(429, detail="智谱搜索频率或并发超限，请稍后重试")
-    if response.status_code in (401, 403):
-        raise HTTPException(502, detail="智谱认证或权限校验失败，请检查服务器 Key 和搜索服务权限")
-    if not response.is_success:
-        raise HTTPException(502, detail="智谱搜索请求失败，请检查账户余额、权限和请求参数")
+        raise HTTPException(502, detail="无法连接智谱搜索服务", headers=auth_headers) from None
+    if upstream.status_code == 429:
+        raise HTTPException(429, detail="智谱搜索频率或并发超限，请稍后重试", headers=auth_headers)
+    if upstream.status_code in (401, 403):
+        raise HTTPException(401, detail="已收到 Authorization，但智谱认证或权限校验失败，请检查传入的 APIKEY 和搜索服务权限", headers=auth_headers)
+    if not upstream.is_success:
+        raise HTTPException(502, detail="已收到 Authorization，智谱搜索请求失败，请检查账户余额、权限和请求参数", headers=auth_headers)
     try:
-        data = response.json()
+        data = upstream.json()
         if not isinstance(data, dict) or data.get("error") or not isinstance(data.get("search_result"), list):
             raise ValueError()
         results = [
@@ -101,6 +105,7 @@ async def search(request: SearchRequest):
             )
             for item in data["search_result"][:request.max_results]
         ]
+        response.headers["X-Auth-Source"] = "client"
         return SearchResponse(query=query, search_engine=request.search_engine, count=len(results), results=results, request_id=data.get("request_id") or data.get("id"))
     except (ValueError, TypeError, AttributeError):
-        raise HTTPException(502, detail="智谱返回异常数据，未生成搜索结果") from None
+        raise HTTPException(502, detail="智谱返回异常数据，未生成搜索结果", headers=auth_headers) from None

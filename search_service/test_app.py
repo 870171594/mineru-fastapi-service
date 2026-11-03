@@ -5,22 +5,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 search_app = importlib.import_module("search_service.app")
-client = TestClient(search_app.app)
+client = TestClient(search_app.app, headers={"Authorization": "Bearer test-key"})
 
 
 def test_health_does_not_expose_key(monkeypatch):
-    monkeypatch.setattr(search_app, "get_api_key", lambda: "secret")
     response = client.get("/search/health")
     assert response.status_code == 200
-    assert response.json()["has_env_key"] is True
+    assert response.json()["auth_mode"] == "client"
     assert "secret" not in response.text
 
 
 def test_missing_key_is_explicit(monkeypatch):
-    monkeypatch.setattr(search_app, "get_api_key", lambda: "")
-    response = client.post("/search", json={"query": "测试搜索"})
-    assert response.status_code == 503
-    assert "ZHIPU_API_KEY" in response.json()["detail"]
+    monkeypatch.setenv("ZHIPU_API_KEY", "must-not-use-server-key")
+    response = TestClient(search_app.app).post("/search", json={"query": "测试搜索"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "请传入鉴权信息：智谱 APIKEY"
+    assert response.headers["X-Auth-Source"] == "missing"
 
 
 def test_invalid_query_and_bounds():
@@ -30,7 +30,6 @@ def test_invalid_query_and_bounds():
 
 def mock_upstream(monkeypatch, handler):
     original_client = httpx.AsyncClient
-    monkeypatch.setattr(search_app, "get_api_key", lambda: "test-key")
     monkeypatch.setattr(search_app.httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(handler), **kwargs))
 
 
@@ -47,7 +46,7 @@ def test_maps_official_response(monkeypatch):
 
 
 @pytest.mark.parametrize("status, body, expected", [
-    (401, {"error": {"message": "secret"}}, 502),
+    (401, {"error": {"message": "secret"}}, 401),
     (429, {}, 429),
     (500, {}, 502),
     (200, {"error": {"message": "secret"}}, 502),
@@ -65,3 +64,11 @@ def test_upstream_timeout(monkeypatch):
         raise httpx.ReadTimeout("timeout", request=request)
     mock_upstream(monkeypatch, handler)
     assert client.post("/search", json={"query": "test"}).status_code == 504
+
+
+def test_raw_key_and_empty_bearer():
+    assert search_app.resolve_auth_token("test-key") == "Bearer test-key"
+    assert search_app.resolve_auth_token("bEaReR test-key") == "Bearer test-key"
+    with pytest.raises(search_app.HTTPException) as exc:
+        search_app.resolve_auth_token("Bearer ")
+    assert exc.value.status_code == 401
