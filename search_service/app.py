@@ -1,5 +1,6 @@
 """Standalone AgentArts search relay using Zhipu Web Search API."""
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import httpx
@@ -52,6 +53,25 @@ class SearchResponse(BaseModel):
     count: int
     results: list[SearchResult]
     request_id: str | None = None
+
+
+class BeijingTimeResponse(BaseModel):
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+    second: int
+
+
+@app.get("/time", response_model=BeijingTimeResponse, summary="获取北京时间（UTC+8），无需鉴权和参数")
+def beijing_time(response: Response):
+    now = datetime.now(timezone(timedelta(hours=8)))
+    response.headers["Cache-Control"] = "no-store"
+    return BeijingTimeResponse(
+        year=now.year, month=now.month, day=now.day,
+        hour=now.hour, minute=now.minute, second=now.second,
+    )
 
 
 @app.get("/search/health")

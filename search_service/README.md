@@ -4,6 +4,26 @@
 
 ## API
 
+### 北京时间
+
+`GET /time`，无需鉴权、查询参数或请求体。按 UTC+8 返回当前北京时间，所有字段均为整数，采用 24 小时制；响应带 `Cache-Control: no-store`。
+
+```json
+{"year": 2026, "month": 11, "day": 4, "hour": 14, "minute": 30, "second": 5}
+```
+
+通过 HTTPS 代理部署时，在现有 TLS server 中增加：
+
+```nginx
+location = /time {
+    proxy_pass http://127.0.0.1:8100/time;
+    proxy_set_header Host $host;
+    proxy_cache off;
+}
+```
+
+### 联网搜索
+
 `POST /search`
 
 请求必须携带 `Authorization: Bearer <调用者的智谱APIKEY>`，也兼容纯 Key。每位插件使用者配置自己的 Key，服务不会回退使用服务器环境变量或 `.env`。未传时返回 `401` 和 `请传入鉴权信息：智谱 APIKEY`。
